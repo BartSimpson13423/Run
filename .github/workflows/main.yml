@@ -1,0 +1,426 @@
+name: ForceRun - full validation and Cloudflare publish
+run-name: "ForceRun validation #${{ github.run_number }}"
+
+on:
+  schedule:
+    - cron: '17 */4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: forcerun-full-validation
+  cancel-in-progress: false
+
+jobs:
+  validate-and-publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    env:
+      XRAY_VERSION: ${{ vars.XRAY_VERSION || '1.8.4' }}
+
+    steps:
+      - name: Validate required settings
+        shell: bash
+        env:
+          TEST_REPO_READ_TOKEN: ${{ secrets.TEST_REPO_READ_TOKEN }}
+          CF_ACCOUNT_ID: ${{ vars.CF_ACCOUNT_ID }}
+          CF_R2_BUCKET: ${{ vars.CF_R2_BUCKET }}
+          CF_R2_ACCESS_KEY_ID: ${{ secrets.CF_R2_ACCESS_KEY_ID }}
+          CF_R2_SECRET_ACCESS_KEY: ${{ secrets.CF_R2_SECRET_ACCESS_KEY }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          ADMIN_ID: ${{ secrets.ADMIN_ID }}
+          CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
+          MINI_APP_URL: ${{ vars.MINI_APP_URL }}
+        run: |
+          set -euo pipefail
+          for name in TEST_REPO_READ_TOKEN CF_ACCOUNT_ID CF_R2_BUCKET CF_R2_ACCESS_KEY_ID CF_R2_SECRET_ACCESS_KEY BOT_TOKEN ADMIN_ID CHANNEL_ID MINI_APP_URL; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "Required GitHub Actions secret/variable is missing: ${name}" >&2
+              exit 1
+            fi
+          done
+          case "$MINI_APP_URL" in
+            https://*) ;;
+            *) echo 'MINI_APP_URL must start with https://' >&2; exit 1 ;;
+          esac
+          if [[ ! "$XRAY_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo 'XRAY_VERSION must look like 1.2.3' >&2
+            exit 1
+          fi
+
+      # Only the workflow is public. Source code is fetched from the private Test repository.
+      # The PAT is not persisted in the checkout's git config.
+      - name: Checkout private source repository
+        id: checkout_private
+        uses: actions/checkout@v7
+        with:
+          repository: BartSimpson13423/Test
+          ref: ${{ vars.TEST_REPO_REF || 'main' }}
+          token: ${{ secrets.TEST_REPO_READ_TOKEN }}
+          path: private-source
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.23.x'
+          cache: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Download pinned Xray runtime
+        working-directory: private-source
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 3 --retry-delay 2 \
+            "https://github.com/XTLS/Xray-core/releases/download/v${XRAY_VERSION}/Xray-linux-64.zip" \
+            -o "$RUNNER_TEMP/Xray-linux-64.zip"
+          unzip -oq "$RUNNER_TEMP/Xray-linux-64.zip" xray geoip.dat geosite.dat -d .
+          chmod +x ./xray
+          ./xray version >/dev/null
+
+      - name: Verify Go modules and tests
+        working-directory: private-source
+        shell: bash
+        run: |
+          set -euo pipefail
+          go mod download
+          go vet ./...
+          go test ./...
+
+      # The Go package itself is in ./output. Generated files must use a different directory,
+      # so the workflow never deletes or uploads the private Go source files.
+      - name: Isolate generated output directory
+        working-directory: private-source
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          import re
+
+          path = Path("config.yaml")
+          text = path.read_text(encoding="utf-8")
+          pattern = re.compile(r'(?m)^([ \t]*output:[ \t]*)(["\']?\./output["\']?)([ \t]*(?:#.*)?)$')
+          updated, count = pattern.subn(lambda m: f"{m.group(1)}./generated-output{m.group(3)}", text, count=1)
+          if count != 1:
+              raise SystemExit("Could not safely set files.output to ./generated-output in config.yaml")
+          path.write_text(updated, encoding="utf-8")
+          PY
+
+      - name: Build full checker
+        working-directory: private-source
+        shell: bash
+        run: |
+          set -euo pipefail
+          go build -trimpath -ldflags='-s -w' -o validator .
+
+      - name: Notify Telegram admin that validation started
+        shell: bash
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          ADMIN_ID: ${{ secrets.ADMIN_ID }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python - <<'PY'
+          import json, os, urllib.request
+          token = os.environ["BOT_TOKEN"]
+          chat_id = os.environ["ADMIN_ID"]
+          text = "🚀 بررسی کامل سرورها در GitHub Actions شروع شد.\nنسخه منتشرشده فعلی تا پایان بررسی حفظ می‌شود.\n" + os.environ["RUN_URL"]
+          try:
+              body = json.dumps({"chat_id": chat_id, "text": text, "disable_web_page_preview": True}).encode()
+              req = urllib.request.Request(f"https://api.telegram.org/bot{token}/sendMessage", data=body, headers={"Content-Type": "application/json"})
+              with urllib.request.urlopen(req, timeout=20) as response:
+                  response.read()
+          except Exception:
+              print("Telegram start notification failed; continuing the validation run.")
+          PY
+
+      - name: Full validation with bounded retries
+        working-directory: private-source
+        shell: bash
+        env:
+          MAX_FAIL_RETRIES: ${{ vars.MAX_FAIL_RETRIES || '2' }}
+          RETRY_AFTER_FAIL_MINUTES: ${{ vars.RETRY_AFTER_FAIL_MINUTES || '10' }}
+        run: |
+          set -euo pipefail
+          max_retries="$MAX_FAIL_RETRIES"
+          retry_minutes="$RETRY_AFTER_FAIL_MINUTES"
+          [[ "$max_retries" =~ ^[0-9]+$ ]] || max_retries=2
+          [[ "$retry_minutes" =~ ^[0-9]+$ ]] || retry_minutes=10
+          (( max_retries <= 5 )) || max_retries=5
+          (( retry_minutes <= 60 )) || retry_minutes=60
+          attempt=0
+          while true; do
+            attempt=$((attempt + 1))
+            echo "Starting validation attempt ${attempt}/$((max_retries + 1))."
+            rm -rf generated-output
+            mkdir -p generated-output logs config
+            # Detailed checker logs may include private server URLs. Keep them on the ephemeral runner only.
+            if ./validator > "$RUNNER_TEMP/forcerun-checker.log" 2>&1; then
+              checker_status=0
+            else
+              checker_status=$?
+            fi
+            if (( checker_status == 0 )) && python - generated-output/servers.json <<'PY'
+          import base64, json, sys
+          from pathlib import Path
+          from urllib.parse import unquote, urlsplit
+
+          def fail(message):
+              print("Output validation failed: " + message, file=sys.stderr)
+              raise SystemExit(1)
+
+          def vmess_payload(url):
+              if not url.lower().startswith("vmess://"):
+                  return None
+              raw = url[len("vmess://"):].split("#", 1)[0].strip()
+              raw += "=" * ((4 - len(raw) % 4) % 4)
+              try:
+                  return json.loads(base64.urlsafe_b64decode(raw.encode("ascii")).decode("utf-8"))
+              except Exception:
+                  try:
+                      return json.loads(base64.b64decode(raw).decode("utf-8"))
+                  except Exception:
+                      return None
+
+          def link_tag(url):
+              payload = vmess_payload(url)
+              if payload is not None:
+                  return str(payload.get("ps", ""))
+              return unquote(urlsplit(url).fragment)
+
+          def identity(server):
+              url = str(server.get("url") or "")
+              payload = vmess_payload(url)
+              if payload is not None:
+                  payload.pop("ps", None)
+                  return str(server.get("protocol") or ""), json.dumps(payload, sort_keys=True, separators=(",", ":"))
+              return str(server.get("protocol") or ""), url.split("#", 1)[0]
+
+          path = Path(sys.argv[1])
+          try:
+              data = json.loads(path.read_text(encoding="utf-8"))
+          except Exception:
+              fail("servers.json is missing or invalid JSON")
+          servers = data.get("servers") if isinstance(data, dict) else None
+          if not isinstance(servers, list) or not servers:
+              fail("servers array is empty")
+          if not data.get("generated_at"):
+              fail("generated_at is missing")
+          if int(data.get("total", -1)) != len(servers):
+              fail("total does not match the number of servers")
+          seen = set()
+          for index, server in enumerate(servers):
+              if not isinstance(server, dict):
+                  fail(f"servers[{index}] is not an object")
+              tag, url = server.get("tag"), server.get("url")
+              if not isinstance(tag, str) or not tag.startswith("@V2rayShad0w | "):
+                  fail(f"servers[{index}] does not use the canonical Railway label")
+              if not isinstance(url, str) or "://" not in url:
+                  fail(f"servers[{index}] has an invalid URL")
+              if link_tag(url) != tag:
+                  fail(f"servers[{index}] label does not match its URL remark")
+              clash = server.get("clash")
+              if clash and tag not in clash:
+                  fail(f"servers[{index}] label does not match the Clash entry")
+              key = identity(server)
+              if key in seen:
+                  fail(f"duplicate server identity at index {index}")
+              seen.add(key)
+          print(f"Validated {len(servers)} servers with canonical Railway labels.")
+          PY
+            then
+              echo "Validation passed."
+              break
+            fi
+            if (( attempt > max_retries )); then
+              echo "Validation failed after ${attempt} attempts; the previous Cloudflare generation will remain active." >&2
+              exit 1
+            fi
+            echo "Validation failed; retrying in ${retry_minutes} minute(s)."
+            sleep "$((retry_minutes * 60))"
+          done
+
+      - name: Install AWS CLI for Cloudflare R2
+        if: success()
+        run: python -m pip install --disable-pip-version-check awscli
+
+      - name: Upload versioned generation to Cloudflare R2
+        id: publish_generation
+        if: success()
+        working-directory: private-source
+        shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.CF_R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.CF_R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          AWS_EC2_METADATA_DISABLED: 'true'
+          CF_ACCOUNT_ID: ${{ vars.CF_ACCOUNT_ID }}
+          CF_R2_BUCKET: ${{ vars.CF_R2_BUCKET }}
+        run: |
+          set -euo pipefail
+          PREFIX="generations/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          ENDPOINT="https://${CF_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          aws s3 sync generated-output/ "s3://${CF_R2_BUCKET}/${PREFIX}/" \
+            --endpoint-url "$ENDPOINT" --no-progress --only-show-errors
+          echo "prefix=${PREFIX}" >> "$GITHUB_OUTPUT"
+          echo "Uploaded a new versioned generation to R2."
+
+      # This manifest code lives in the public workflow, not in the private source checkout.
+      - name: Build latest-generation pointer
+        if: success()
+        working-directory: private-source
+        env:
+          MANIFEST_PREFIX: ${{ steps.publish_generation.outputs.prefix }}
+        run: |
+          python - <<'PY'
+          import json, os
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          data = json.loads(Path("generated-output/servers.json").read_text(encoding="utf-8"))
+          prefix = os.environ["MANIFEST_PREFIX"].strip("/")
+          if not prefix.startswith("generations/") or ".." in prefix:
+              raise SystemExit("Invalid generation prefix")
+          manifest = {
+              "prefix": prefix,
+              "snapshot_key": f"{prefix}/servers.json",
+              "generated_at": data["generated_at"],
+              "total": int(data["total"]),
+              "revision": 0,
+              "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+          }
+          Path(os.environ["RUNNER_TEMP"], "latest.json").write_text(
+              json.dumps(manifest, ensure_ascii=False, separators=(",", ":")), encoding="utf-8"
+          )
+          PY
+
+      - name: Atomically switch Cloudflare R2 latest pointer
+        if: success()
+        shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.CF_R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.CF_R2_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          AWS_EC2_METADATA_DISABLED: 'true'
+          CF_ACCOUNT_ID: ${{ vars.CF_ACCOUNT_ID }}
+          CF_R2_BUCKET: ${{ vars.CF_R2_BUCKET }}
+        run: |
+          set -euo pipefail
+          ENDPOINT="https://${CF_ACCOUNT_ID}.r2.cloudflarestorage.com"
+          aws s3 cp "$RUNNER_TEMP/latest.json" "s3://${CF_R2_BUCKET}/latest.json" \
+            --endpoint-url "$ENDPOINT" --content-type 'application/json' --cache-control 'no-store' --only-show-errors
+          echo "Cloudflare latest pointer updated."
+
+      - name: Notify Telegram channel and admin
+        if: success()
+        working-directory: private-source
+        shell: bash
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          ADMIN_ID: ${{ secrets.ADMIN_ID }}
+          CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
+          MINI_APP_URL: ${{ vars.MINI_APP_URL }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python - <<'PY'
+          import json, os, urllib.request
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          token = os.environ["BOT_TOKEN"]
+          admin = os.environ["ADMIN_ID"]
+          channel = os.environ["CHANNEL_ID"]
+          mini_url = os.environ["MINI_APP_URL"]
+          run_url = os.environ["RUN_URL"]
+
+          def send(chat_id, message, markup=None):
+              body = {"chat_id": chat_id, "text": message[:3900], "disable_web_page_preview": True}
+              if markup:
+                  body["reply_markup"] = markup
+              request = urllib.request.Request(
+                  f"https://api.telegram.org/bot{token}/sendMessage",
+                  data=json.dumps(body, ensure_ascii=False).encode(),
+                  headers={"Content-Type": "application/json"},
+              )
+              with urllib.request.urlopen(request, timeout=20) as response:
+                  payload = json.loads(response.read().decode("utf-8"))
+              if not payload.get("ok"):
+                  raise RuntimeError("Telegram API rejected a notification")
+
+          try:
+              data = json.loads(Path("generated-output/servers.json").read_text(encoding="utf-8"))
+              servers = data["servers"]
+              total = sum(1 for server in servers if not server.get("down"))
+              counts = {}
+              for server in servers:
+                  if server.get("down"):
+                      continue
+                  proto = str(server.get("protocol", "unknown")).lower()
+                  if proto == "shadowsocks":
+                      proto = "ss"
+                  counts[proto] = counts.get(proto, 0) + 1
+              stamp = str(data.get("generated_at", ""))
+              try:
+                  dt = datetime.fromisoformat(stamp.replace("Z", "+00:00")).astimezone(timezone.utc)
+                  date_text, time_text = dt.strftime("%Y-%m-%d"), dt.strftime("%H:%M:%S")
+              except Exception:
+                  date_text, time_text = stamp or "نامشخص", "نامشخص"
+              message = "\n".join([
+                  "✅ ✅ ✅ l لیست سرورها بروزرسانی شد l 🔄 🔄 🔄", "",
+                  f"🔢 All Servers: {total}", "",
+                  f"├ 🔐 SS: {counts.get('ss', 0)}",
+                  f"├ 🛡 TROJAN: {counts.get('trojan', 0)}",
+                  f"├ ⚡ VLESS: {counts.get('vless', 0)}",
+                  f"└ 🌐 VMESS: {counts.get('vmess', 0)}", "",
+                  f"🕒 Update time: {date_text} | {time_text}", "", "━━━━━━━━━━━━━━", "",
+                  "📥 برای دریافت لینک سرورها، وب‌اپ را باز کنید و فیلترهای دلخواهتان را انتخاب کنید 👇",
+              ])
+              markup = {"inline_keyboard": [[{"text": "📥 دریافت لینک کلاینت", "url": mini_url}]]} if mini_url.startswith("https://") else None
+              try:
+                  send(channel, message, markup)
+                  channel_error = False
+              except Exception:
+                  channel_error = True
+              admin_message = "✅ اجرای بررسی کامل و انتشار خروجی در Cloudflare موفق بود.\n" + f"مجموع سرورهای سالم: {total}\nنسل داده: {stamp}\n" + run_url
+              if channel_error:
+                  admin_message += "\n⚠️ ارسال اعلان به کانال ناموفق بود."
+              send(admin, admin_message)
+              print("Telegram notifications processed.")
+          except Exception:
+              # Do not fail a successful validation/publication just because Telegram is unavailable.
+              print("Telegram success notification failed; Cloudflare publication remains successful.")
+          PY
+
+      - name: Notify Telegram admin about a failed run
+        if: failure() && steps.checkout_private.outcome == 'success'
+        shell: bash
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          ADMIN_ID: ${{ secrets.ADMIN_ID }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python - <<'PY'
+          import json, os, urllib.request
+          token = os.environ.get("BOT_TOKEN", "")
+          admin = os.environ.get("ADMIN_ID", "")
+          if not token or not admin:
+              print("Failure notification skipped because Telegram settings are missing.")
+              raise SystemExit(0)
+          text = "❌ بررسی کامل سرورها در GitHub Actions ناموفق بود.\nنسخه معتبر قبلی در Cloudflare حفظ شده است.\n" + os.environ["RUN_URL"]
+          try:
+              body = json.dumps({"chat_id": admin, "text": text, "disable_web_page_preview": True}).encode()
+              req = urllib.request.Request(f"https://api.telegram.org/bot{token}/sendMessage", data=body, headers={"Content-Type": "application/json"})
+              with urllib.request.urlopen(req, timeout=20) as response:
+                  response.read()
+          except Exception:
+              print("Telegram failure notification could not be delivered.")
+          PY
