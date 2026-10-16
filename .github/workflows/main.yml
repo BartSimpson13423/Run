@@ -18,7 +18,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 300
     env:
-      XRAY_VERSION: ${{ vars.XRAY_VERSION || '1.8.4' }}
+      XRAY_VERSION: ${{ vars.XRAY_VERSION || '26.3.27' }}
 
     steps:
       - name: Validate required settings
@@ -46,7 +46,7 @@ jobs:
             *) echo 'MINI_APP_URL must start with https://' >&2; exit 1 ;;
           esac
           if [[ ! "$XRAY_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo 'XRAY_VERSION must look like 1.2.3' >&2
+            echo 'XRAY_VERSION must look like 1.2.3 or 26.3.27' >&2
             exit 1
           fi
 
@@ -144,32 +144,41 @@ jobs:
           PY
 
       - name: Full validation with bounded retries
+        id: validation
         working-directory: private-source
         shell: bash
         env:
-          MAX_FAIL_RETRIES: ${{ vars.MAX_FAIL_RETRIES || '2' }}
+          MAX_FAIL_RETRIES: ${{ vars.MAX_FAIL_RETRIES || '3' }}
           RETRY_AFTER_FAIL_MINUTES: ${{ vars.RETRY_AFTER_FAIL_MINUTES || '10' }}
         run: |
           set -euo pipefail
           max_retries="$MAX_FAIL_RETRIES"
           retry_minutes="$RETRY_AFTER_FAIL_MINUTES"
-          [[ "$max_retries" =~ ^[0-9]+$ ]] || max_retries=2
+          [[ "$max_retries" =~ ^[0-9]+$ ]] || max_retries=3
           [[ "$retry_minutes" =~ ^[0-9]+$ ]] || retry_minutes=10
           (( max_retries <= 5 )) || max_retries=5
           (( retry_minutes <= 60 )) || retry_minutes=60
+
           attempt=0
+          last_fail_reason="unknown"
+
           while true; do
             attempt=$((attempt + 1))
-            echo "Starting validation attempt ${attempt}/$((max_retries + 1))."
+            echo "======== Starting validation attempt ${attempt}/$((max_retries + 1)) ========"
             rm -rf generated-output
             mkdir -p generated-output logs config
-            # Detailed checker logs may include private server URLs. Keep them on the ephemeral runner only.
-            if ./validator > "$RUNNER_TEMP/forcerun-checker.log" 2>&1; then
-              checker_status=0
-            else
+
+            # Run the checker; capture full log for diagnostics.
+            checker_status=0
+            if ! ./validator > "$RUNNER_TEMP/forcerun-checker.log" 2>&1; then
               checker_status=$?
             fi
-            if (( checker_status == 0 )) && python - generated-output/servers.json <<'PY'
+
+            python_ok=false
+            python_err=""
+            if (( checker_status == 0 )); then
+              set +e
+              python_output=$(python - generated-output/servers.json 2>&1 <<'PY'
           import base64, json, sys
           from pathlib import Path
           from urllib.parse import unquote, urlsplit
@@ -237,17 +246,60 @@ jobs:
               seen.add(key)
           print(f"Validated {len(servers)} servers with canonical Railway labels.")
           PY
-            then
-              echo "Validation passed."
+          )
+              python_rc=$?
+              set -e
+              if (( python_rc == 0 )); then
+                python_ok=true
+              else
+                python_err="$python_output"
+              fi
+            fi
+
+            if (( checker_status == 0 )) && $python_ok; then
+              echo "Validation passed on attempt ${attempt}."
+              echo "attempt=${attempt}" >> "$GITHUB_OUTPUT"
               break
             fi
+
+            # Diagnose failure reason
+            if (( checker_status != 0 )); then
+              last_fail_reason="validator exited with code ${checker_status}"
+            elif [[ -n "$python_err" ]]; then
+              last_fail_reason=$(echo "$python_err" | head -n 3 | tr '\n' ' ' | cut -c1-200)
+            else
+              last_fail_reason="unknown validation failure"
+            fi
+
+            echo "----- Checker log (last 100 lines) -----"
+            tail -n 100 "$RUNNER_TEMP/forcerun-checker.log" || true
+            echo "----------------------------------------"
+            if [[ -n "$python_err" ]]; then
+              echo "----- Python validation error -----"
+              echo "$python_err"
+              echo "-----------------------------------"
+            fi
+            echo "Failure reason: ${last_fail_reason}"
+
             if (( attempt > max_retries )); then
               echo "Validation failed after ${attempt} attempts; the previous Cloudflare generation will remain active." >&2
+              echo "final_fail_reason=${last_fail_reason}" >> "$GITHUB_OUTPUT"
+              echo "attempt=${attempt}" >> "$GITHUB_OUTPUT"
               exit 1
             fi
-            echo "Validation failed; retrying in ${retry_minutes} minute(s)."
+
+            echo "Validation failed (attempt ${attempt}); retrying in ${retry_minutes} minute(s). Reason: ${last_fail_reason}"
             sleep "$((retry_minutes * 60))"
           done
+
+      - name: Upload checker log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: forcerun-checker-log-${{ github.run_id }}
+          path: ${{ runner.temp }}/forcerun-checker.log
+          retention-days: 5
+          if-no-files-found: ignore
 
       - name: Install AWS CLI for Cloudflare R2
         if: success()
@@ -353,8 +405,8 @@ jobs:
               )
               with urllib.request.urlopen(request, timeout=20) as response:
                   payload = json.loads(response.read().decode("utf-8"))
-              if not payload.get("ok"):
-                  raise RuntimeError("Telegram API rejected a notification")
+                  if not payload.get("ok"):
+                      raise RuntimeError("Telegram API rejected a notification")
 
           try:
               data = json.loads(Path("generated-output/servers.json").read_text(encoding="utf-8"))
@@ -407,6 +459,8 @@ jobs:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           ADMIN_ID: ${{ secrets.ADMIN_ID }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          FAIL_REASON: ${{ steps.validation.outputs.final_fail_reason || 'unknown' }}
+          ATTEMPT: ${{ steps.validation.outputs.attempt || '?' }}
         run: |
           python - <<'PY'
           import json, os, urllib.request
@@ -415,7 +469,15 @@ jobs:
           if not token or not admin:
               print("Failure notification skipped because Telegram settings are missing.")
               raise SystemExit(0)
-          text = "❌ بررسی کامل سرورها در GitHub Actions ناموفق بود.\nنسخه معتبر قبلی در Cloudflare حفظ شده است.\n" + os.environ["RUN_URL"]
+          reason = os.environ.get("FAIL_REASON", "unknown")
+          attempt = os.environ.get("ATTEMPT", "?")
+          text = (
+              "❌ بررسی کامل سرورها در GitHub Actions ناموفق بود.\n"
+              f"تلاش نهایی: {attempt}\n"
+              f"دلیل تقریبی: {reason}\n"
+              "نسخه معتبر قبلی در Cloudflare حفظ شده است.\n"
+              + os.environ["RUN_URL"]
+          )
           try:
               body = json.dumps({"chat_id": admin, "text": text, "disable_web_page_preview": True}).encode()
               req = urllib.request.Request(f"https://api.telegram.org/bot{token}/sendMessage", data=body, headers={"Content-Type": "application/json"})
