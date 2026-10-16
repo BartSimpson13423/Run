@@ -16,7 +16,7 @@ concurrency:
 jobs:
   validate-and-publish:
     runs-on: ubuntu-latest
-    timeout-minutes: 300
+    timeout-minutes: 350
     env:
       XRAY_VERSION: ${{ vars.XRAY_VERSION || '26.3.27' }}
 
@@ -33,9 +33,11 @@ jobs:
           ADMIN_ID: ${{ secrets.ADMIN_ID }}
           CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
           MINI_APP_URL: ${{ vars.MINI_APP_URL }}
+          CF_WORKER_API_URL: ${{ vars.CF_WORKER_API_URL }}
+          CF_INTERNAL_API_TOKEN: ${{ secrets.CF_INTERNAL_API_TOKEN }}
         run: |
           set -euo pipefail
-          for name in TEST_REPO_READ_TOKEN CF_ACCOUNT_ID CF_R2_BUCKET CF_R2_ACCESS_KEY_ID CF_R2_SECRET_ACCESS_KEY BOT_TOKEN ADMIN_ID CHANNEL_ID MINI_APP_URL; do
+          for name in TEST_REPO_READ_TOKEN CF_ACCOUNT_ID CF_R2_BUCKET CF_R2_ACCESS_KEY_ID CF_R2_SECRET_ACCESS_KEY BOT_TOKEN ADMIN_ID CHANNEL_ID MINI_APP_URL CF_WORKER_API_URL CF_INTERNAL_API_TOKEN; do
             if [[ -z "${!name:-}" ]]; then
               echo "Required GitHub Actions secret/variable is missing: ${name}" >&2
               exit 1
@@ -46,9 +48,16 @@ jobs:
             *) echo 'MINI_APP_URL must start with https://' >&2; exit 1 ;;
           esac
           if [[ ! "$XRAY_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo 'XRAY_VERSION must look like 1.2.3 or 26.3.27' >&2
+            echo 'XRAY_VERSION must look like 1.2.3' >&2
             exit 1
           fi
+          python - <<'PY'
+          import os
+          from urllib.parse import urlsplit
+          u = urlsplit(os.environ["CF_WORKER_API_URL"])
+          if u.scheme != "https" or not u.netloc or u.path not in ("", "/") or u.query or u.fragment:
+              raise SystemExit("CF_WORKER_API_URL must be the HTTPS origin of the Cloudflare Worker, without a path")
+          PY
 
       # Only the workflow is public. Source code is fetched from the private Test repository.
       # The PAT is not persisted in the checkout's git config.
@@ -66,7 +75,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v7
         with:
-          go-version: '1.23.x'
+          go-version: '1.27.x'
           cache: false
 
       - name: Set up Python
@@ -122,63 +131,113 @@ jobs:
           set -euo pipefail
           go build -trimpath -ldflags='-s -w' -o validator .
 
-      - name: Notify Telegram admin that validation started
+      - name: Full validation with bounded retries
+        working-directory: private-source
         shell: bash
         env:
+          MAX_FAIL_RETRIES: ${{ vars.MAX_FAIL_RETRIES || '2' }}
+          RETRY_AFTER_FAIL_MINUTES: ${{ vars.RETRY_AFTER_FAIL_MINUTES || '10' }}
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           ADMIN_ID: ${{ secrets.ADMIN_ID }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          python - <<'PY'
-          import json, os, urllib.request
-          token = os.environ["BOT_TOKEN"]
-          chat_id = os.environ["ADMIN_ID"]
-          text = "🚀 بررسی کامل سرورها در GitHub Actions شروع شد.\nنسخه منتشرشده فعلی تا پایان بررسی حفظ می‌شود.\n" + os.environ["RUN_URL"]
-          try:
-              body = json.dumps({"chat_id": chat_id, "text": text, "disable_web_page_preview": True}).encode()
-              req = urllib.request.Request(f"https://api.telegram.org/bot{token}/sendMessage", data=body, headers={"Content-Type": "application/json"})
-              with urllib.request.urlopen(req, timeout=20) as response:
-                  response.read()
-          except Exception:
-              print("Telegram start notification failed; continuing the validation run.")
-          PY
-
-      - name: Full validation with bounded retries
-        id: validation
-        working-directory: private-source
-        shell: bash
-        env:
-          MAX_FAIL_RETRIES: ${{ vars.MAX_FAIL_RETRIES || '3' }}
-          RETRY_AFTER_FAIL_MINUTES: ${{ vars.RETRY_AFTER_FAIL_MINUTES || '10' }}
-        run: |
           set -euo pipefail
           max_retries="$MAX_FAIL_RETRIES"
           retry_minutes="$RETRY_AFTER_FAIL_MINUTES"
-          [[ "$max_retries" =~ ^[0-9]+$ ]] || max_retries=3
+          [[ "$max_retries" =~ ^[0-9]+$ ]] || max_retries=2
           [[ "$retry_minutes" =~ ^[0-9]+$ ]] || retry_minutes=10
           (( max_retries <= 5 )) || max_retries=5
           (( retry_minutes <= 60 )) || retry_minutes=60
-
           attempt=0
-          last_fail_reason="unknown"
-
           while true; do
             attempt=$((attempt + 1))
-            echo "======== Starting validation attempt ${attempt}/$((max_retries + 1)) ========"
+            echo "Starting validation attempt ${attempt}/$((max_retries + 1))."
             rm -rf generated-output
             mkdir -p generated-output logs config
-
-            # Run the checker; capture full log for diagnostics.
-            checker_status=0
-            if ! ./validator > "$RUNNER_TEMP/forcerun-checker.log" 2>&1; then
+            # Keep raw server URLs only in the ephemeral runner log. The live console
+            # receives aggregate counters from a separate private JSON progress file.
+            progress_file="$RUNNER_TEMP/forcerun-progress.json"
+            rm -f "$progress_file" "$progress_file.tmp"
+            export PROGRESS_FILE="$progress_file"
+            ./validator > "$RUNNER_TEMP/forcerun-checker.log" 2>&1 &
+            checker_pid=$!
+            notified=0
+            while kill -0 "$checker_pid" 2>/dev/null; do
+              if [[ -s "$progress_file" ]]; then
+                IFS=$'\t' read -r stage sources_total sources_done sources_usable sources_rejected sampled parsed tcp_selected tcp_done tcp_pass tcp_fail tcp_active xray_selected xray_done xray_pass xray_rejected xray_active elapsed eta < <(python - "$progress_file" <<'PY'
+          import json, sys
+          try:
+              d=json.load(open(sys.argv[1], encoding="utf-8"))
+          except Exception:
+              d={}
+          fields=["stage","sources_total","sources_completed","sources_usable","sources_rejected","sampled_servers","parsed_unique","tcp_selected","tcp_completed","tcp_passed","tcp_failed","tcp_in_progress","xray_selected","xray_completed","xray_passed","xray_rejected","xray_in_progress","elapsed_seconds","estimated_remaining_seconds"]
+          print("\t".join(str(d.get(k,"-")) for k in fields))
+          PY
+          )
+                echo "LIVE stage=${stage} sources=${sources_done}/${sources_total} usable=${sources_usable} rejected=${sources_rejected} sampled=${sampled} parsed=${parsed} TCP=${tcp_done}/${tcp_selected} tcp_ok=${tcp_pass} tcp_rejected=${tcp_fail} tcp_active=${tcp_active} Xray=${xray_done}/${xray_selected} xray_ok=${xray_pass} xray_rejected=${xray_rejected} xray_active=${xray_active} elapsed=${elapsed}s ETA=${eta}s"
+                if (( notified == 0 )) && [[ "$stage" == "testing" ]] && [[ "$xray_selected" =~ ^[0-9]+$ ]] && (( xray_selected > 0 )) && [[ "$xray_done" =~ ^[0-9]+$ ]] && (( xray_done >= (xray_selected < 10 ? xray_selected : 10) )) && [[ "$eta" =~ ^[0-9]+$ ]]; then
+                  python - "$progress_file" <<'PY'
+          import datetime, json, os, sys, urllib.request
+          try:
+              d=json.load(open(sys.argv[1], encoding="utf-8"))
+              eta=max(0,int(d.get("estimated_remaining_seconds",0)))
+              finish=(datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(seconds=eta)).strftime("%Y-%m-%d %H:%M UTC")
+              msg=("🚀 بررسی کامل ForceRun\n"
+                   f"سرورهای انتخاب‌شده برای Xray: {int(d.get('xray_selected',0)):,}\n"
+                   f"تست‌شده: {int(d.get('xray_completed',0)):,} | در حال تست: {int(d.get('xray_in_progress',0)):,}\n"
+                   f"موفق: {int(d.get('xray_passed',0)):,} | ردشده: {int(d.get('xray_rejected',0)):,}\n"
+                   f"TCP: {int(d.get('tcp_completed',0)):,}/{int(d.get('tcp_selected',0)):,} | عبور: {int(d.get('tcp_passed',0)):,} | رد: {int(d.get('tcp_failed',0)):,}\n"
+                   f"منابع قابل‌استفاده: {int(d.get('sources_usable',0))}/{int(d.get('sources_total',0))} | ردشده: {int(d.get('sources_rejected',0))}\n"
+                   f"نمونهٔ جمع‌آوری‌شده: {int(d.get('sampled_servers',0)):,} | یکتا و قابل‌پردازش: {int(d.get('parsed_unique',0)):,}\n"
+                   f"زمان سپری‌شده: {int(d.get('elapsed_seconds',0))//60} دقیقه | ETA حدودی: {eta//60} دقیقه\n"
+                   f"پایان تقریبی: {finish}\n{os.environ['RUN_URL']}")
+              payload=json.dumps({"chat_id":os.environ["ADMIN_ID"],"text":msg,"disable_web_page_preview":True}).encode()
+              req=urllib.request.Request(f"https://api.telegram.org/bot{os.environ['BOT_TOKEN']}/sendMessage",data=payload,headers={"Content-Type":"application/json"})
+              with urllib.request.urlopen(req, timeout=15) as response: response.read()
+              print("Sent Telegram admin report with selected count and measured ETA.")
+          except Exception as exc:
+              print(f"Telegram progress notification failed (non-fatal): {type(exc).__name__}")
+          PY
+                  notified=1
+                fi
+              fi
+              sleep 10
+            done
+            if wait "$checker_pid"; then
+              checker_status=0
+            else
               checker_status=$?
+              echo "Checker failed (exit=$checker_status). Detailed private log remains on the ephemeral runner."
             fi
-
-            python_ok=false
-            python_err=""
-            if (( checker_status == 0 )); then
-              set +e
-              python_output=$(python - generated-output/servers.json 2>&1 <<'PY'
+            # Emit one final aggregate snapshot even when a short run finished
+            # between the 10-second polling ticks. This contains no server URLs.
+            if [[ -s "$progress_file" ]]; then
+              python - "$progress_file" "$checker_status" "$RUN_URL" <<'PY'
+          import json, os, sys, urllib.request
+          from pathlib import Path
+          path, status, run_url = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+          try:
+              d=json.loads(Path(path).read_text(encoding="utf-8"))
+          except Exception:
+              d={}
+          print("FINAL stage={stage} sources={sources_completed}/{sources_total} usable={sources_usable} rejected={sources_rejected} sampled={sampled_servers} parsed={parsed_unique} TCP={tcp_completed}/{tcp_selected} Xray={xray_completed}/{xray_selected} xray_ok={xray_passed} xray_rejected={xray_rejected} elapsed={elapsed_seconds}s".format(**{k:d.get(k,"-") for k in ["stage","sources_completed","sources_total","sources_usable","sources_rejected","sampled_servers","parsed_unique","tcp_completed","tcp_selected","xray_completed","xray_selected","xray_passed","xray_rejected","elapsed_seconds"]}))
+          if status == 0 and d.get("stage") == "completed" and int(d.get("xray_selected",0) or 0)>0 and os.environ.get("BOT_TOKEN") and os.environ.get("ADMIN_ID"):
+              try:
+                  msg=("✅ اجرای کوتاه ForceRun پیش از اعلان دوره‌ای کامل شد.\n"
+                       f"سرورهای انتخاب‌شده برای Xray: {int(d.get('xray_selected',0)):,}\n"
+                       f"تست‌شده: {int(d.get('xray_completed',0)):,} | موفق: {int(d.get('xray_passed',0)):,} | ردشده: {int(d.get('xray_rejected',0)):,}\n"
+                       f"منابع قابل‌استفاده: {int(d.get('sources_usable',0))}/{int(d.get('sources_total',0))} | ردشده: {int(d.get('sources_rejected',0))}\n"
+                       f"زمان اجرا: {int(d.get('elapsed_seconds',0))} ثانیه\nپایان ثبت‌شده: تکمیل شده پیش از اولین اعلان دوره‌ای\n{run_url}")
+                  body=json.dumps({"chat_id":os.environ["ADMIN_ID"],"text":msg,"disable_web_page_preview":True}).encode()
+                  req=urllib.request.Request(f"https://api.telegram.org/bot{os.environ['BOT_TOKEN']}/sendMessage",data=body,headers={"Content-Type":"application/json"})
+                  with urllib.request.urlopen(req,timeout=15) as response: response.read()
+                  print("Sent fallback Telegram report for a short run.")
+              except Exception as exc:
+                  print(f"Telegram short-run notification failed (non-fatal): {type(exc).__name__}")
+          PY
+            fi
+            unset PROGRESS_FILE
+            if (( checker_status == 0 )) && python - generated-output/servers.json <<'PY'
           import base64, json, sys
           from pathlib import Path
           from urllib.parse import unquote, urlsplit
@@ -246,60 +305,17 @@ jobs:
               seen.add(key)
           print(f"Validated {len(servers)} servers with canonical Railway labels.")
           PY
-          )
-              python_rc=$?
-              set -e
-              if (( python_rc == 0 )); then
-                python_ok=true
-              else
-                python_err="$python_output"
-              fi
-            fi
-
-            if (( checker_status == 0 )) && $python_ok; then
-              echo "Validation passed on attempt ${attempt}."
-              echo "attempt=${attempt}" >> "$GITHUB_OUTPUT"
+            then
+              echo "Validation passed."
               break
             fi
-
-            # Diagnose failure reason
-            if (( checker_status != 0 )); then
-              last_fail_reason="validator exited with code ${checker_status}"
-            elif [[ -n "$python_err" ]]; then
-              last_fail_reason=$(echo "$python_err" | head -n 3 | tr '\n' ' ' | cut -c1-200)
-            else
-              last_fail_reason="unknown validation failure"
-            fi
-
-            echo "----- Checker log (last 100 lines) -----"
-            tail -n 100 "$RUNNER_TEMP/forcerun-checker.log" || true
-            echo "----------------------------------------"
-            if [[ -n "$python_err" ]]; then
-              echo "----- Python validation error -----"
-              echo "$python_err"
-              echo "-----------------------------------"
-            fi
-            echo "Failure reason: ${last_fail_reason}"
-
             if (( attempt > max_retries )); then
               echo "Validation failed after ${attempt} attempts; the previous Cloudflare generation will remain active." >&2
-              echo "final_fail_reason=${last_fail_reason}" >> "$GITHUB_OUTPUT"
-              echo "attempt=${attempt}" >> "$GITHUB_OUTPUT"
               exit 1
             fi
-
-            echo "Validation failed (attempt ${attempt}); retrying in ${retry_minutes} minute(s). Reason: ${last_fail_reason}"
+            echo "Validation failed; retrying in ${retry_minutes} minute(s)."
             sleep "$((retry_minutes * 60))"
           done
-
-      - name: Upload checker log on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: forcerun-checker-log-${{ github.run_id }}
-          path: ${{ runner.temp }}/forcerun-checker.log
-          retention-days: 5
-          if-no-files-found: ignore
 
       - name: Install AWS CLI for Cloudflare R2
         if: success()
@@ -319,58 +335,50 @@ jobs:
           CF_R2_BUCKET: ${{ vars.CF_R2_BUCKET }}
         run: |
           set -euo pipefail
-          PREFIX="generations/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          PREFIX="generations/${GITHUB_RUN_NUMBER}-${GITHUB_RUN_ATTEMPT}-${GITHUB_RUN_ID}"
           ENDPOINT="https://${CF_ACCOUNT_ID}.r2.cloudflarestorage.com"
           aws s3 sync generated-output/ "s3://${CF_R2_BUCKET}/${PREFIX}/" \
             --endpoint-url "$ENDPOINT" --no-progress --only-show-errors
           echo "prefix=${PREFIX}" >> "$GITHUB_OUTPUT"
           echo "Uploaded a new versioned generation to R2."
 
-      # This manifest code lives in the public workflow, not in the private source checkout.
-      - name: Build latest-generation pointer
+      - name: Publish generation through Cloudflare compare-and-swap
         if: success()
         working-directory: private-source
-        env:
-          MANIFEST_PREFIX: ${{ steps.publish_generation.outputs.prefix }}
-        run: |
-          python - <<'PY'
-          import json, os
-          from datetime import datetime, timezone
-          from pathlib import Path
-
-          data = json.loads(Path("generated-output/servers.json").read_text(encoding="utf-8"))
-          prefix = os.environ["MANIFEST_PREFIX"].strip("/")
-          if not prefix.startswith("generations/") or ".." in prefix:
-              raise SystemExit("Invalid generation prefix")
-          manifest = {
-              "prefix": prefix,
-              "snapshot_key": f"{prefix}/servers.json",
-              "generated_at": data["generated_at"],
-              "total": int(data["total"]),
-              "revision": 0,
-              "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
-          }
-          Path(os.environ["RUNNER_TEMP"], "latest.json").write_text(
-              json.dumps(manifest, ensure_ascii=False, separators=(",", ":")), encoding="utf-8"
-          )
-          PY
-
-      - name: Atomically switch Cloudflare R2 latest pointer
-        if: success()
         shell: bash
         env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.CF_R2_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.CF_R2_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION: auto
-          AWS_EC2_METADATA_DISABLED: 'true'
-          CF_ACCOUNT_ID: ${{ vars.CF_ACCOUNT_ID }}
-          CF_R2_BUCKET: ${{ vars.CF_R2_BUCKET }}
+          CF_WORKER_API_URL: ${{ vars.CF_WORKER_API_URL }}
+          CF_INTERNAL_API_TOKEN: ${{ secrets.CF_INTERNAL_API_TOKEN }}
+          MANIFEST_PREFIX: ${{ steps.publish_generation.outputs.prefix }}
+          RUN_NUMBER: ${{ github.run_number }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
           set -euo pipefail
-          ENDPOINT="https://${CF_ACCOUNT_ID}.r2.cloudflarestorage.com"
-          aws s3 cp "$RUNNER_TEMP/latest.json" "s3://${CF_R2_BUCKET}/latest.json" \
-            --endpoint-url "$ENDPOINT" --content-type 'application/json' --cache-control 'no-store' --only-show-errors
-          echo "Cloudflare latest pointer updated."
+          python - <<'PY'
+          import json, os, urllib.error, urllib.request
+          from pathlib import Path
+          from urllib.parse import urlsplit
+          base=os.environ["CF_WORKER_API_URL"].rstrip("/")
+          u=urlsplit(base)
+          if u.scheme!="https" or not u.netloc or u.path not in ("", "/") or u.query or u.fragment:
+              raise SystemExit("CF_WORKER_API_URL must be a Worker HTTPS origin")
+          prefix=os.environ["MANIFEST_PREFIX"].strip("/")
+          if not prefix.startswith("generations/") or ".." in prefix or len(prefix.split("/"))!=2:
+              raise SystemExit("Invalid generation prefix")
+          data=json.loads(Path("generated-output/servers.json").read_text(encoding="utf-8"))
+          payload={"prefix":prefix,"snapshot_key":f"{prefix}/servers.json","generated_at":data["generated_at"],
+                   "total":int(data["total"]),"run_number":int(os.environ["RUN_NUMBER"]),"run_attempt":int(os.environ["RUN_ATTEMPT"])}
+          request=urllib.request.Request(base+"/internal/v1/publish",data=json.dumps(payload).encode(),
+              headers={"Authorization":"Bearer "+os.environ["CF_INTERNAL_API_TOKEN"],"Content-Type":"application/json"},method="POST")
+          try:
+              with urllib.request.urlopen(request,timeout=45) as response:
+                  result=json.loads(response.read().decode("utf-8"))
+                  if response.status!=200 or result.get("ok") is not True: raise SystemExit("Cloudflare did not confirm publication")
+          except urllib.error.HTTPError as exc:
+              detail=exc.read(2048).decode("utf-8","replace")
+              raise SystemExit(f"Cloudflare rejected generation publication (HTTP {exc.code}): {detail}")
+          print(f"Published {result.get('total')} servers using D1 conditional pointer update: {result.get('snapshot_key')}")
+          PY
 
       - name: Notify Telegram channel and admin
         if: success()
@@ -405,8 +413,8 @@ jobs:
               )
               with urllib.request.urlopen(request, timeout=20) as response:
                   payload = json.loads(response.read().decode("utf-8"))
-                  if not payload.get("ok"):
-                      raise RuntimeError("Telegram API rejected a notification")
+              if not payload.get("ok"):
+                  raise RuntimeError("Telegram API rejected a notification")
 
           try:
               data = json.loads(Path("generated-output/servers.json").read_text(encoding="utf-8"))
@@ -459,8 +467,6 @@ jobs:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           ADMIN_ID: ${{ secrets.ADMIN_ID }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          FAIL_REASON: ${{ steps.validation.outputs.final_fail_reason || 'unknown' }}
-          ATTEMPT: ${{ steps.validation.outputs.attempt || '?' }}
         run: |
           python - <<'PY'
           import json, os, urllib.request
@@ -469,15 +475,7 @@ jobs:
           if not token or not admin:
               print("Failure notification skipped because Telegram settings are missing.")
               raise SystemExit(0)
-          reason = os.environ.get("FAIL_REASON", "unknown")
-          attempt = os.environ.get("ATTEMPT", "?")
-          text = (
-              "❌ بررسی کامل سرورها در GitHub Actions ناموفق بود.\n"
-              f"تلاش نهایی: {attempt}\n"
-              f"دلیل تقریبی: {reason}\n"
-              "نسخه معتبر قبلی در Cloudflare حفظ شده است.\n"
-              + os.environ["RUN_URL"]
-          )
+          text = "❌ بررسی کامل سرورها در GitHub Actions ناموفق بود.\nنسخه معتبر قبلی در Cloudflare حفظ شده است.\n" + os.environ["RUN_URL"]
           try:
               body = json.dumps({"chat_id": admin, "text": text, "disable_web_page_preview": True}).encode()
               req = urllib.request.Request(f"https://api.telegram.org/bot{token}/sendMessage", data=body, headers={"Content-Type": "application/json"})
